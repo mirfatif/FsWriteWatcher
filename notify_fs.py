@@ -6,7 +6,6 @@ import hashlib
 import inspect
 import os.path
 import pickle
-import re
 import signal
 import sys
 import threading
@@ -18,8 +17,17 @@ from pypager.source import GeneratorSource
 from pypager.pager import Pager
 import native_bind
 
-NNG_SOCK_PATH = 'ipc:///tmp/notify_fs.sock'
+PROTO_IPC = 'ipc://'
+NNG_SOCK_PATH = '/tmp/notify_fs.sock'
 DUMP_FILE = '/home/irfan/notify_fs.dump'
+
+
+def print_err(msg: str):
+    print(msg, file=sys.stderr)
+
+
+def print_exc(ex: Exception):
+    print(ex, file=sys.stderr)
 
 
 class Queue:
@@ -191,15 +199,15 @@ def start_nng_server():
         try:
             cmd: ClientCmd = pickle.loads(msg.bytes)
         except pickle.UnpicklingError as ex:
-            print('Bad command received from client:', ex)
+            print_err(f'Bad command received from client: {ex}')
             continue
 
         if not isinstance(cmd, ClientCmd):
-            print(f'Bad command type "{type(cmd)}"')
+            print_err(f'Bad command type "{type(cmd)}"')
             continue
 
         if cmd.cmd != ClientCmd.CMD_GET_EVENT_LIST:
-            print(f'Bad command received from client: {cmd.cmd}')
+            print_err(f'Bad command received from client: {cmd.cmd}')
             continue
 
         with _events_lock:
@@ -233,6 +241,10 @@ def start_nng_server():
         msg.pipe.send(pickle.dumps(data))
 
 
+def to_str(lst: list, joiner: str = ' '):
+    return joiner.join(str(s) for s in lst)
+
+
 def check_caps() -> None:
     # include <linux/capability.h>
     cap_dac_read_search = 1 << 2
@@ -252,15 +264,14 @@ def check_caps() -> None:
                 missing_caps.append('cap_sys_admin')
 
             if len(missing_caps) == 1:
-                print('Missing capability:', missing_caps[0], file=sys.stderr)
+                print_err(f'Missing capability: {missing_caps[0]}')
             elif len(missing_caps) > 1:
-                print('Missing capabilities: ', end='', file=sys.stderr)
-                print(*missing_caps, sep=', ', file=sys.stderr)
+                print_err(f'Missing capabilities: {to_str(missing_caps, joiner=", ")}')
 
             break
 
     if len(missing_caps):
-        os.system(f'priv_exec --caps=dac_read_search,sys_admin -- {" ".join(s for s in sys.argv)}')
+        os.system(f'priv_exec --caps=dac_read_search,sys_admin -- {to_str(sys.argv)}')
         sys.exit()
 
 
@@ -277,7 +288,7 @@ def start_server():
         try:
             native_bind.start_fs_events_nat(handle_event)
         except OSError as ex:
-            print(f'line {inspect.currentframe().f_lineno}:', ex)
+            print_err(f'line {inspect.currentframe().f_lineno}: {ex}')
             _quit()
 
     threading.Thread(target=call_nat, name="FsEventListener", daemon=False).start()
@@ -405,17 +416,17 @@ def print_data(data: Data):
 
 
 def start_client() -> None:
-    if not os.path.exists(re.sub('^ipc://', '', NNG_SOCK_PATH)):
-        print('Server not running')
+    if not os.path.exists(NNG_SOCK_PATH):
+        print_err('Server not running')
         exit(1)
 
-    client = pynng.Req0(dial=NNG_SOCK_PATH, send_timeout=1000, recv_timeout=5000)
+    client = pynng.Req0(dial=f'{PROTO_IPC}{NNG_SOCK_PATH}', send_timeout=1000, recv_timeout=5000)
     client.send(pickle.dumps(_client_cmd))
     data: Data = pickle.loads(client.recv())
     client.close()
 
     if not data.total_count.grand_total:
-        print('No events found')
+        print_err('No events found')
     else:
         pager = pypager.pager.Pager()
         pager.add_source(pypager.source.GeneratorSource(print_data(data)))
@@ -477,12 +488,12 @@ def get_opts() -> ClientCmd | None:
             ]
         )
     except getopt.GetoptError as e:
-        print(e)
+        print_exc(e)
         print_help()
         sys.exit(1)
 
     if args:
-        print('Unexpected arguments:', *args)
+        print_err(f'Unexpected arguments: {to_str(args)}')
         print_help(1)
 
     cmd: ClientCmd | None = ClientCmd()
@@ -490,7 +501,7 @@ def get_opts() -> ClientCmd | None:
 
     def assert_not_server(option: str):
         if not cmd:
-            print(f'--{option} is mutually exclusive with --{opt_server}')
+            print_err(f'--{option} is mutually exclusive with --{opt_server}')
             print_help(1)
 
     for opt, val in opts:
@@ -500,14 +511,14 @@ def get_opts() -> ClientCmd | None:
         elif opt == f'--{opt_sort_by}':
             assert_not_server(opt_sort_by)
             if val not in ftr.FILTERS_ALL:
-                print(f'Bad {opt_sort_by}:', val)
+                print_err(f'Bad {opt_sort_by}: {val}')
                 print_help(1)
             cmd.sort_by = val
 
         elif opt == f'--{opt_f_uid}':
             assert_not_server(opt_f_uid)
             if val != ClientCmd.Filter.NONE and not val.isdecimal():
-                print(f'Bad {opt_f_uid}:', val)
+                print_err(f'Bad {opt_f_uid}: {val}')
                 print_help(1)
             ftr.uid = val
 
@@ -522,7 +533,7 @@ def get_opts() -> ClientCmd | None:
         elif opt == f'--{opt_f_event}':
             assert_not_server(opt_f_event)
             if val not in native_bind.FS_EVENTS:
-                print(f'Bad {opt_f_event}:', val)
+                print_err(f'Bad {opt_f_event}: {val}')
                 print_help(1)
             ftr.event = val
 
@@ -535,7 +546,7 @@ def get_opts() -> ClientCmd | None:
             if val == ClientCmd.Filter.NONE:
                 cmd.max_results = None
             elif not val.isdecimal():
-                print(f'Bad {opt_max_res}:', val)
+                print_err(f'Bad {opt_max_res}: {val}')
                 print_help(1)
             else:
                 cmd.max_results = int(val)
@@ -559,7 +570,7 @@ if __name__ == '__main__':
         _events: dict[str, SimpleNamespace] = {}
         _events_lock = threading.Lock()
 
-        nng_server = pynng.Rep0(listen=NNG_SOCK_PATH, send_timeout=2000)
+        nng_server = pynng.Rep0(listen=f'{PROTO_IPC}{NNG_SOCK_PATH}', send_timeout=2000)
 
         _dump_ts: int = 0
         _terminated: bool = False
