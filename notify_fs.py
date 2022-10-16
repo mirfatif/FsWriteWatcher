@@ -241,10 +241,11 @@ def check_caps() -> None:
     with open(os.path.join(f'/proc/{os.getpid()}/status')) as f:
         lines = f.readlines()
 
+    missing_caps = []
+
     for line in lines:
         if line.startswith('CapEff:'):
             eff_caps = int(line[line.index('\t') + 1:-1], 16)
-            missing_caps = []
             if not (eff_caps & cap_dac_read_search):
                 missing_caps.append('cap_dac_read_search')
             if not (eff_caps & cap_sys_admin):
@@ -258,10 +259,12 @@ def check_caps() -> None:
 
             break
 
+    if len(missing_caps):
+        os.system(f'priv_exec --caps=dac_read_search,sys_admin -- {" ".join(s for s in sys.argv)}')
+        sys.exit()
+
 
 def start_server():
-    check_caps()
-
     for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
         signal.signal(sig, _quit)
 
@@ -550,6 +553,8 @@ def get_opts() -> ClientCmd | None:
 
 if __name__ == '__main__':
     if not (_client_cmd := get_opts()):
+        check_caps()
+
         _queue: Queue = Queue()
         _events: dict[str, SimpleNamespace] = {}
         _events_lock = threading.Lock()
