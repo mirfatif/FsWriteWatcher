@@ -20,7 +20,7 @@
 
 //////////////////////////////////////////////////////////////////////////////
 
-#define TAG "notify_fs"
+#define TAG "fa_notify"
 
 static int print_error(bool with_code, char *format, va_list args)
 {
@@ -268,7 +268,7 @@ static int handle_events(int fan_fd, int mnt_fd, void (*cb)(struct fs_event))
                         {
                             print_err_code("Failed to open file handle");
 
-                            if (errno == ENOMEM)
+                            if (errno == ENOMEM || errno == ELOOP)
                                 snprintf(file_path, sizeof(file_path), "(%s)", strerror(errno));
                             else
                             {

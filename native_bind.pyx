@@ -1,6 +1,6 @@
 from libc.stdlib cimport EXIT_FAILURE
 
-cdef extern from 'notify_fs.c':
+cdef extern from 'fa_notify.c':
     struct fs_event:
         int uid
         int gid

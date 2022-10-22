@@ -1,33 +1,44 @@
 #!/usr/bin/python
 
 import collections
+import datetime
 import getopt
 import hashlib
 import inspect
 import os.path
 import pickle
 import signal
+import stat
+import subprocess
 import sys
 import threading
 import time
+import traceback
 from types import SimpleNamespace
+from typing import Callable
+
 import pynng
 import pypager
-from pypager.source import GeneratorSource
 from pypager.pager import Pager
-import native_bind
+from pypager.source import GeneratorSource
 
-PROTO_IPC = 'ipc://'
-NNG_SOCK_PATH = '/tmp/notify_fs.sock'
-DUMP_FILE = '/home/irfan/notify_fs.dump'
-
-
-def print_err(msg: str):
-    print(msg, file=sys.stderr)
+NNG_SOCK_PATH = f'/tmp/{os.path.basename(sys.argv[0])}.sock'
+DUMP_FILE_PATH = f'{os.getenv("HOME") or "/var/log/"}/{os.path.basename(sys.argv[0])}.dump'
+MAX_RESULTS = 10
+DEBUG_LEVEL = 0
 
 
-def print_exc(ex: Exception):
-    print(ex, file=sys.stderr)
+def print_exc_line():
+    etype, value, tb = sys.exc_info()
+    print(''.join(traceback.format_exception_only(etype, value)), file=sys.stderr, end='')
+
+
+def print_err(msg: str, no_newline: bool = False):
+    end = '\n'
+    if no_newline:
+        end = ''
+
+    print(msg, file=sys.stderr, end=end)
 
 
 class Queue:
@@ -61,50 +72,57 @@ class Queue:
             self.waiter.notify()
 
 
-def save_dump():
-    with _events_lock:
-        with open(f'{DUMP_FILE}.tmp', 'wb') as f:
-            pickle.dump(_events, f)
+def save_dump(print_msg: bool = False):
+    with events_lock:
+        with open(f'{dump_file_path}.tmp', 'wb') as f:
+            pickle.dump(dump_start_time, f)
+            pickle.dump(events, f)
 
-        os.rename(f'{DUMP_FILE}.tmp', DUMP_FILE)
-
-        print(f'Dumped {len(_events)} events')
+        os.rename(f'{dump_file_path}.tmp', dump_file_path)
+        if print_msg:
+            print(f'Dumped {len(events)} events')
 
 
 def load_dumps():
     try:
-        with open(DUMP_FILE, 'rb') as f:
-            events = pickle.load(f)
+        with open(dump_file_path, 'rb') as f:
+            start_time: float = pickle.load(f)
+            loaded_events = pickle.load(f)
     except FileNotFoundError:
         pass
     else:
-        global _events
-        _events = events
-        print(f'Loaded {len(_events)} events')
+        global dump_start_time, events
+        dump_start_time = start_time
+        events = loaded_events
+        print(f'Loaded {len(events)} events')
 
 
 def handle_event(evt: dict):
-    _queue.put(evt)
+    raw_events.put(evt)
 
 
-def _quit(sig: int = None, *_):
+def kill_me(sig: int = None, *_):
     if sys.stdout.isatty():
-        if sig:
-            print(f'\rReceived signal {signal.strsignal(sig)}, exiting...')
-        else:
-            print('\rExiting...')
+        print(f'\r')
 
-    save_dump()
-    nng_server.close()
+    if sig:
+        print(f'{signal.strsignal(sig)}, exiting...')
+    else:
+        print('Exiting...')
+
+    save_dump(True)
+    if nng_server:
+        nng_server.close()
 
     # poll() in C receives EINTR only if running on main
     # thread. So we need to exit the loop manually.
     native_bind.stop_fs_events()
 
-    _queue.end()
+    if raw_events:
+        raw_events.end()
 
-    global _terminated
-    _terminated = True
+    global terminated
+    terminated = True
 
 
 class Data:
@@ -120,6 +138,7 @@ class Data:
             self.grand_total += count
 
     def __init__(self):
+        self.start_time: float = dump_start_time
         self.total_count: Data.EventCount = Data.EventCount()
         self.lst: list[SimpleNamespace] = []
         self.uid_cnt: dict[str, Data.EventCount] | list[tuple[str, Data.EventCount]] = {}
@@ -188,18 +207,18 @@ class Data:
 
 
 def start_nng_server():
-    while not _terminated:
+    while not terminated:
         try:
             msg: pynng.Message = nng_server.recv_msg()
-        except pynng.exceptions.Closed as ex:
-            print(f'line {inspect.currentframe().f_lineno}: '
-                  f'Exiting {threading.current_thread().name}:', ex)
+        except pynng.exceptions.Closed:
+            Thread.exit_msg_exc(inspect.currentframe().f_lineno)
             return
 
         try:
             cmd: ClientCmd = pickle.loads(msg.bytes)
-        except pickle.UnpicklingError as ex:
-            print_err(f'Bad command received from client: {ex}')
+        except pickle.UnpicklingError:
+            print_err('Bad command received from client: ', no_newline=True)
+            print_exc_line()
             continue
 
         if not isinstance(cmd, ClientCmd):
@@ -210,22 +229,22 @@ def start_nng_server():
             print_err(f'Bad command received from client: {cmd.cmd}')
             continue
 
-        with _events_lock:
-            lst = list(_events.values())
+        with events_lock:
+            lst = list(events.values())
 
         data: Data = Data()
         f = cmd.filter
 
         for ev in lst:
             if f:
-                if (f.uid == f.NONE and not ev.uid) or (f.uid is not None and ev.uid != f.uid):
+                if (f.uid == f.UNKNOWN and not ev.uid) or (f.uid is not None and ev.uid != f.uid):
                     continue
 
-                if (f.cmd == f.NONE and ev.cmd) or \
+                if (f.cmd == f.UNKNOWN and ev.cmd) or \
                         (ev.cmd and f.cmd is not None and not ev.cmd.startswith(f.cmd)):
                     continue
 
-                if (f.p_cmd == f.NONE and ev.p_cmd) or \
+                if (f.p_cmd == f.UNKNOWN and ev.p_cmd) or \
                         (ev.p_cmd and f.p_cmd is not None and not ev.p_cmd.startswith(f.p_cmd)):
                     continue
 
@@ -239,6 +258,45 @@ def start_nng_server():
 
         data.finalize(cmd.max_results)
         msg.pipe.send(pickle.dumps(data))
+
+
+class Thread(threading.Thread):
+    def __init__(self, target: Callable, name=None, daemon=False):
+        super(Thread, self).__init__(target=Thread._run_target, args=[target], name=name, daemon=daemon)
+
+    @staticmethod
+    def _run_target(func: Callable):
+        Thread.set_excepthook()
+        print(f'Starting thread {threading.current_thread().name}...')
+        func()
+        Thread.exit_msg()
+
+    @staticmethod
+    def set_excepthook():
+        if threading.current_thread() is threading.main_thread():
+            sys.excepthook = Thread.handle_uncaught_err
+        else:
+            threading.excepthook = lambda args: Thread.handle_uncaught_err(*args[:-1])
+
+    @staticmethod
+    def handle_uncaught_err(err_type, value, tb):
+        print_err(f'Uncaught exception in thread: {threading.current_thread().name}:')
+        traceback.print_exception(err_type, value, tb)
+        kill_me()
+
+    @staticmethod
+    def exit_msg():
+        print(f'Exiting {threading.current_thread().name}...')
+
+    @staticmethod
+    def exit_msg_exc(lineno: int = None):
+        if lineno:
+            print_err(f'line {lineno}: '
+                      f'Exception in {threading.current_thread().name}: ', no_newline=True)
+            print_exc_line()
+        else:
+            print_err(f'Exception in {threading.current_thread().name}')
+            traceback.print_exc()
 
 
 def to_str(lst: list, joiner: str = ' '):
@@ -264,36 +322,36 @@ def check_caps() -> None:
                 missing_caps.append('cap_sys_admin')
 
             if len(missing_caps) == 1:
-                print_err(f'Missing capability: {missing_caps[0]}')
+                print_err(f'Missing capability: {missing_caps[0]}, restarting...')
             elif len(missing_caps) > 1:
-                print_err(f'Missing capabilities: {to_str(missing_caps, joiner=", ")}')
+                print_err(f'Missing capabilities: {to_str(missing_caps, joiner=", ")}, restarting...')
 
             break
 
-    if len(missing_caps):
-        os.system(f'priv_exec --caps=dac_read_search,sys_admin -- {to_str(sys.argv)}')
-        sys.exit()
+    if sys.stdin.isatty() and len(missing_caps):
+        os.execvp('priv_exec', ['priv_exec', '--caps=dac_read_search,sys_admin', '--', *sys.argv])
+        print_err('Failed to execute priv_exec')
+        sys.exit(1)
 
 
 def start_server():
     for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
-        signal.signal(sig, _quit)
+        signal.signal(sig, kill_me)
 
     load_dumps()
 
-    print('Starting command server...')
-    threading.Thread(target=start_nng_server, name='NNGServer', daemon=False).start()
+    global nng_server
+    nng_server = pynng.Rep0(listen=ipc_address, send_timeout=2000)
+    os.chmod(nng_sock_path,
+             stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH | stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
 
-    def call_nat():
-        try:
-            native_bind.start_fs_events_nat(handle_event)
-        except OSError as ex:
-            print_err(f'line {inspect.currentframe().f_lineno}: {ex}')
-            _quit()
+    Thread(target=start_nng_server, name='NNGServer').start()
+    Thread(target=lambda: native_bind.start_fs_events_nat(handle_event), name="FsEventListener").start()
 
-    threading.Thread(target=call_nat, name="FsEventListener", daemon=False).start()
+    Thread.set_excepthook()
 
-    while evt := _queue.get():
+    print(f'Parsing raw events queue on {threading.current_thread().name}...')
+    while evt := raw_events.get():
         uid = evt['uid']
         gid = evt['gid']
         cmd = evt['cmd'].decode()
@@ -314,11 +372,11 @@ def start_server():
         key = uid + '|' + gid + '|' + cmd + '|' + p_cmd + '|' + evt_name + '|' + path
         key: str = hashlib.md5(key.encode()).hexdigest()
 
-        with _events_lock:
-            if e := _events.get(key):
+        with events_lock:
+            if e := events.get(key):
                 e.count += 1
             else:
-                _events[key] = SimpleNamespace(
+                events[key] = SimpleNamespace(
                     uid=uid,
                     gid=gid,
                     cmd=cmd,
@@ -328,19 +386,20 @@ def start_server():
                     count=1
                 )
 
-        global _dump_ts
+        global last_dump_ts
 
-        if _dump_ts + 300 < time.time():
-            save_dump()
-            _dump_ts = time.time()
+        if last_dump_ts + 300 < time.time():
+            save_dump(debug_level >= 2)
+            last_dump_ts = time.time()
+
+    Thread.exit_msg()
 
 
 class ClientCmd:
     CMD_GET_EVENT_LIST: int = 0
-    DEF_MAX_COUNT: int = 10
 
     class Filter:
-        NONE: str = 'none'
+        UNKNOWN: str = 'unknown'
 
         FILTER_UID: str = 'uid'
         FILTER_CMD: str = 'cmd'
@@ -363,13 +422,13 @@ class ClientCmd:
     def __init__(self):
         self.cmd: int = self.CMD_GET_EVENT_LIST
         self.filter: ClientCmd.Filter | None = None
-        self.max_results: int = self.DEF_MAX_COUNT
+        self.max_results: int = MAX_RESULTS
 
 
 def print_data(data: Data):
     def header(name: str):
         return [
-            ('bold underline fg:red', f'\n{name}\n'),
+            ('bold underline fg:#7CB9E8', f'\n{name}\n'),
             ('', '=================================================\n')
         ]
 
@@ -384,7 +443,10 @@ def print_data(data: Data):
             for i in lst
         ]
 
-    yield [('', f'Total events: {data.total_count.grand_total} | {data.total_count.total}\n')]
+    yield [
+        ('', f'Since: {datetime.datetime.fromtimestamp(data.start_time).strftime("%d-%b-%y %I:%M%p")}\n'),
+        ('', f'Total events: {data.total_count.grand_total} | {data.total_count.total}\n')
+    ]
 
     yield header('UID')
     yield summary(data.uid_cnt)
@@ -416,43 +478,58 @@ def print_data(data: Data):
 
 
 def start_client() -> None:
-    if not os.path.exists(NNG_SOCK_PATH):
+    if not os.path.exists(nng_sock_path):
         print_err('Server not running')
-        exit(1)
+        print_usage()
+        sys.exit(1)
 
-    client = pynng.Req0(dial=f'{PROTO_IPC}{NNG_SOCK_PATH}', send_timeout=1000, recv_timeout=5000)
-    client.send(pickle.dumps(_client_cmd))
-    data: Data = pickle.loads(client.recv())
-    client.close()
+    client = pynng.Req0(dial=ipc_address, send_timeout=1000, recv_timeout=5000)
+    try:
+        client.send(pickle.dumps(client_cmd))
+        data: Data = pickle.loads(client.recv())
+    finally:
+        client.close()
 
     if not data.total_count.grand_total:
         print_err('No events found')
+    elif not sys.stdout.isatty():
+        for lst in print_data(data):
+            for line in lst:
+                print(line[1], end='')
     else:
         pager = pypager.pager.Pager()
         pager.add_source(pypager.source.GeneratorSource(print_data(data)))
         pager.run()
 
 
-def print_help(ex_code: int = None) -> None:
-    print()
-    print(f'Usage:\n\t{os.path.basename(sys.argv[0])} [-h|--help] '
-          f'[--server] [--filter-<FILTER>=<FILTER_VAL>] [--max-results=COUNT]')
+def print_usage(ex_code: int = None) -> None:
+    print(f'\nUsage:\n\t{os.path.basename(sys.argv[0])} [OPTIONS]')
+    print(f'\nOptions:')
+    print(f'\t-h|--help                Show help')
+    print(f'\t--sock=<PATH>            Unix socket path (default: {NNG_SOCK_PATH})')
+    print(f'\t--max=all|<NUM>          Max no. of results (default: {MAX_RESULTS})')
+    print(f'\t--filter-<TYPE>=<VALUE>  Apply filters to list')
+    print(f'\t--server                 Run server')
+    print(f'\t--dump-file=<PATH>       Dump file path (default: {DUMP_FILE_PATH})')
+    print(f'\t--debug=1|2              Debug level (default: {DEBUG_LEVEL})')
 
     f = ClientCmd.Filter
 
-    print('\n\tFILTER\n\t\t', end='')
-    print(*f.FILTERS_ALL)
+    print('\n\tFilter TYPE:\n\t\t', end='')
+    print(', '.join(f.FILTERS_ALL))
+    print(f'\n\t\t{f.FILTER_UID}: process user id')
+    print(f'\t\t{f.FILTER_CMD}: process commandline')
+    print(f'\t\t{f.FILTER_P_CMD}: parent cmd')
+    print(f'\t\t{f.FILTER_EVENT}: filesystem event')
+    print(f'\t\t{f.FILTER_PATH}: event file path')
 
-    print(f'\n\tFILTER_VAL\n\t\t', end='')
-    print(f'{ClientCmd.Filter.NONE} (for {f.FILTER_UID}, {f.FILTER_CMD} and {f.FILTER_P_CMD})')
-    print(f'\t\tEVENT (for {f.FILTER_EVENT})')
-    print(f'\t\tA value (except for {f.FILTER_EVENT})')
+    print(f'\n\tFilter VALUE:\n\t\t', end='')
+    print(f'{f.UNKNOWN} (for: {f.FILTER_UID}, {f.FILTER_CMD}, {f.FILTER_P_CMD})')
+    print(f'\t\tEVENT (for: {f.FILTER_EVENT})')
+    print(f'\t\tA value (not for: {f.FILTER_EVENT})')
 
-    print('\n\tEVENT\n\t\t', end='')
-    print(*native_bind.FS_EVENTS)
-
-    print('\n\tCOUNT\n\t\t', end='')
-    print(f'{ClientCmd.Filter.NONE} or a number (default {ClientCmd.DEF_MAX_COUNT})')
+    print('\n\tFilter EVENT:\n\t\t', end='')
+    print(', '.join(native_bind.FS_EVENTS))
 
     print()
 
@@ -460,16 +537,18 @@ def print_help(ex_code: int = None) -> None:
         sys.exit(ex_code)
 
 
-def get_opts() -> ClientCmd | None:
+def get_opts() -> None:
     opt_help: str = 'help'
     opt_server: str = 'server'
-    opt_sort_by: str = 'sort-by'
+    opt_socket: str = 'sock'
+    opt_dump_file: str = 'dump-file'
+    opt_debug: str = 'debug'
     opt_f_uid: str = 'filter-uid'
     opt_f_cmd: str = 'filter-cmd'
     opt_f_pcmd: str = 'filter-pcmd'
     opt_f_event: str = 'filter-event'
     opt_f_path: str = 'filter-path'
-    opt_max_res: str = 'max-results'
+    opt_max_res: str = 'max'
 
     try:
         opts, args = getopt.getopt(
@@ -478,7 +557,9 @@ def get_opts() -> ClientCmd | None:
             [
                 opt_help,
                 opt_server,
-                f'{opt_sort_by}=',
+                f'{opt_socket}=',
+                f'{opt_dump_file}=',
+                f'{opt_debug}=',
                 f'{opt_f_uid}=',
                 f'{opt_f_cmd}=',
                 f'{opt_f_pcmd}=',
@@ -487,39 +568,56 @@ def get_opts() -> ClientCmd | None:
                 f'{opt_max_res}='
             ]
         )
-    except getopt.GetoptError as e:
-        print_exc(e)
-        print_help()
+    except getopt.GetoptError:
+        print_exc_line()
+        print_usage()
         sys.exit(1)
 
     if args:
         print_err(f'Unexpected arguments: {to_str(args)}')
-        print_help(1)
+        print_usage(1)
 
-    cmd: ClientCmd | None = ClientCmd()
-    ftr: ClientCmd.Filter | None = ClientCmd.Filter()
+    if (f'--{opt_server}', '') in opts:
+        cmd = ftr = None
+    else:
+        cmd: ClientCmd | None = ClientCmd()
+        ftr: ClientCmd.Filter | None = ClientCmd.Filter()
+
+    global nng_sock_path, dump_file_path, debug_level, client_cmd
 
     def assert_not_server(option: str):
         if not cmd:
             print_err(f'--{option} is mutually exclusive with --{opt_server}')
-            print_help(1)
+            sys.exit(1)
+
+    def assert_server(option: str):
+        if cmd:
+            print_err(f'--{option} can only be used with --{opt_server}')
+            sys.exit(1)
 
     for opt, val in opts:
         if opt == f'--{opt_server}':
-            cmd = ftr = None
+            pass
 
-        elif opt == f'--{opt_sort_by}':
-            assert_not_server(opt_sort_by)
-            if val not in ftr.FILTERS_ALL:
-                print_err(f'Bad {opt_sort_by}: {val}')
-                print_help(1)
-            cmd.sort_by = val
+        elif opt == f'--{opt_socket}':
+            nng_sock_path = val
+
+        elif opt == f'--{opt_debug}':
+            assert_server(opt_debug)
+            if not val.isdecimal():
+                print_err(f'"{val}" is not an integer')
+                sys.exit(1)
+            debug_level = int(val)
+
+        elif opt == f'--{opt_dump_file}':
+            assert_server(opt_dump_file)
+            dump_file_path = val
 
         elif opt == f'--{opt_f_uid}':
             assert_not_server(opt_f_uid)
-            if val != ClientCmd.Filter.NONE and not val.isdecimal():
+            if val != ClientCmd.Filter.UNKNOWN and not val.isdecimal():
                 print_err(f'Bad {opt_f_uid}: {val}')
-                print_help(1)
+                sys.exit(1)
             ftr.uid = val
 
         elif opt == f'--{opt_f_cmd}':
@@ -534,7 +632,7 @@ def get_opts() -> ClientCmd | None:
             assert_not_server(opt_f_event)
             if val not in native_bind.FS_EVENTS:
                 print_err(f'Bad {opt_f_event}: {val}')
-                print_help(1)
+                sys.exit(1)
             ftr.event = val
 
         elif opt == f'--{opt_f_path}':
@@ -543,38 +641,95 @@ def get_opts() -> ClientCmd | None:
 
         elif opt == f'--{opt_max_res}':
             assert_not_server(opt_max_res)
-            if val == ClientCmd.Filter.NONE:
+            if val.startswith('all'):
                 cmd.max_results = None
             elif not val.isdecimal():
                 print_err(f'Bad {opt_max_res}: {val}')
-                print_help(1)
+                sys.exit(1)
             else:
                 cmd.max_results = int(val)
 
         elif opt == f'--{opt_help}' or opt == '-h':
-            print_help(0)
+            print_usage(0)
         else:
             sys.exit(1)  # Should not happen.
 
-    if cmd and ftr and not ftr.is_empty():
+    if ftr and not ftr.is_empty():
         cmd.filter = ftr
 
-    return cmd
+    client_cmd = cmd
+
+
+def build_library(mod) -> None:
+    if not sys.stdin.isatty():
+        return
+
+    my_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
+
+    lib = f'{mod}.so'
+    if os.path.exists(os.path.join(my_dir, lib)):
+        return
+
+    cwd = os.getcwd()
+    os.chdir(my_dir)
+
+    print('Building native library...')
+
+    def del_file(*files):
+        for file in files:
+            if os.path.exists(file):
+                os.remove(file)
+
+    c = f'{mod}.c'
+
+    # cproto -f1 proc_event_connector.c | grep -vE '/\*' | sed 's|;\s$||'
+
+    try:
+        if not (err := subprocess.call(f'cython -3 {mod}.pyx -o {c}'.split())):
+            ver = f'{sys.version_info[0]}.{sys.version_info[1]}'
+            cp = subprocess.run(f'python{ver}-config --includes'.split(),
+                                stdout=subprocess.PIPE, text=True)
+
+            if not (err := cp.returncode):
+                include = cp.stdout[:-1]
+                err = err or subprocess.call(f'cc -shared -fPIC {include} {c} -o {lib}'.split())
+                err = err or subprocess.call(f'strip -s -S --strip-unneeded {lib}'.split())
+
+        if err:
+            del_file(lib)
+            print_err('Failed to build native library')
+            sys.exit(err)
+    finally:
+        del_file(c)
+        os.chdir(cwd)
 
 
 if __name__ == '__main__':
-    if not (_client_cmd := get_opts()):
-        check_caps()
+    build_library('native_bind')
+    import native_bind
 
-        _queue: Queue = Queue()
-        _events: dict[str, SimpleNamespace] = {}
-        _events_lock = threading.Lock()
+    nng_sock_path: str = NNG_SOCK_PATH
+    dump_file_path = DUMP_FILE_PATH
+    debug_level: int = DEBUG_LEVEL
+    client_cmd: ClientCmd | None = None
 
-        nng_server = pynng.Rep0(listen=f'{PROTO_IPC}{NNG_SOCK_PATH}', send_timeout=2000)
+    get_opts()
 
-        _dump_ts: int = 0
-        _terminated: bool = False
+    ipc_address: str = f'ipc://{nng_sock_path}'
 
-        start_server()
-    else:
+    if client_cmd:
         start_client()
+        sys.exit()
+
+    check_caps()
+
+    raw_events: Queue = Queue()
+    events: dict[str, SimpleNamespace] = {}
+    events_lock = threading.Lock()
+    nng_server: pynng.Socket
+
+    dump_start_time: float = time.time()
+    last_dump_ts: int = 0
+    terminated: bool = False
+
+    start_server()
