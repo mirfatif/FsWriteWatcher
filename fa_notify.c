@@ -268,7 +268,7 @@ static int handle_events(int fan_fd, int mnt_fd, void (*cb)(struct fs_event))
                         {
                             print_err_code("Failed to open file handle");
 
-                            if (errno == ENOMEM || errno == ELOOP)
+                            if (errno == ENOMEM || errno == ELOOP || errno == ENXIO)
                                 snprintf(file_path, sizeof(file_path), "(%s)", strerror(errno));
                             else
                             {
