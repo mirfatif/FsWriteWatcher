@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdarg.h>
+#include <mntent.h>
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -134,7 +135,7 @@ static void get_pid_info(pid_t pid, struct pid_info *pid_info)
         return;
 
     char *line = NULL;
-    size_t n = 0, len;
+    size_t n = 0;
     int ppid, uid, gid = -1;
 
     while (getline(&line, &n, file) > 0)
@@ -341,11 +342,34 @@ static void stop_fs_events()
     terminate = true;
 }
 
-static int start_fs_events(void (*cb)(struct fs_event))
+static int start_fs_events(const char *mount_path, void (*cb)(struct fs_event))
 {
-    int mnt_fd = open("/", O_DIRECTORY | O_RDONLY);
+    bool is_mp = false;
+
+    FILE *mounts = setmntent("/proc/self/mounts", "r");
+
+    if (mounts == NULL)
+        return print_err_code("Failed to open /proc/self/mounts");
+
+    struct mntent *ent;
+
+    while ((ent = getmntent(mounts)) != NULL)
+    {
+        if (!strcmp(ent->mnt_dir, mount_path))
+        {
+            is_mp = true;
+            break;
+        }
+    }
+
+    endmntent(mounts);
+
+    if (!is_mp)
+        return print_err("%s is not a mount point", mount_path);
+
+    int mnt_fd = open(mount_path, O_DIRECTORY | O_RDONLY);
     if (mnt_fd == -1)
-        return print_err_code("Failed to open mount FD");
+        return print_err_code("Failed to open mount fd at %s", mount_path);
 
     // FAN_NONBLOCK makes read() non-blocking.
     unsigned int class = FAN_CLASS_NOTIF | FAN_REPORT_FID | FAN_REPORT_DFID_NAME | FAN_NONBLOCK;
@@ -361,7 +385,7 @@ static int start_fs_events(void (*cb)(struct fs_event))
     unsigned int action = FAN_MARK_ADD | FAN_MARK_FILESYSTEM;
     uint64_t events = FAN_MODIFY | FAN_ATTRIB | FAN_CREATE | FAN_DELETE | FAN_MOVE | FAN_ONDIR;
 
-    if (fanotify_mark(fan_fd, action, events, AT_FDCWD, "/"))
+    if (fanotify_mark(fan_fd, action, events, AT_FDCWD, mount_path))
         res = print_err_code("Failed to add fanotify mark");
     else
     {
@@ -400,7 +424,9 @@ static int start_fs_events(void (*cb)(struct fs_event))
             if (terminate)
                 break;
 
-            if (res = handle_events(fan_fd, mnt_fd, cb))
+            res = handle_events(fan_fd, mnt_fd, cb);
+
+            if (res)
                 break;
 
             // EOF
@@ -421,7 +447,8 @@ static void print_event(struct fs_event evt)
     fflush(NULL);
 }
 
-int main()
+int main(int argc, char **argv)
 {
-    return start_fs_events(&print_event);
+    char *mount_path = argc > 1 ? argv[1] : "/";
+    return start_fs_events(mount_path, &print_event);
 }
