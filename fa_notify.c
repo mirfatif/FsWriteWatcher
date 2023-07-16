@@ -318,7 +318,8 @@ static int handle_events(int fan_fd, int mnt_fd, void (*cb)(struct fs_event))
                     err = print_err("Failed to read all headers, remaining length: %ld", info_len);
             }
             else
-                err = print_err("No (D)FID info received in event");
+                // Why???
+                print_err("No (D)FID info received in event");
 
             close(emd->fd);
 
@@ -412,7 +413,7 @@ static int start_fs_events(const char *mount_path, void (*cb)(struct fs_event))
 
             if (pfd.revents & POLLERR || pfd.revents & POLLNVAL)
             {
-                res = print_err("Netlink poll failed");
+                res = print_err("Filesystem notify poll failed");
                 break;
             }
 
