@@ -136,7 +136,7 @@ static void get_pid_info(pid_t pid, struct pid_info *pid_info)
 
     char *line = NULL;
     size_t n = 0;
-    int ppid, uid, gid = -1;
+    int ppid = -1, uid = -1, gid = -1;
 
     while (getline(&line, &n, file) > 0)
     {
@@ -304,7 +304,7 @@ static int handle_events(int fan_fd, int mnt_fd, void (*cb)(struct fs_event))
                         }
                     }
 
-                    for (int i = 0; i < sizeof(EVENTS) / sizeof(EVENTS[0]); i++)
+                    for (unsigned int i = 0; i < sizeof(EVENTS) / sizeof(EVENTS[0]); i++)
                     {
                         if ((is_dfid || !IS_DUP_EVENT(EVENTS[i])) && emd->mask & EVENTS[i])
                             handle_event(emd->pid, EVENT_NAMES[i], file_path, file_name, is_dir, cb);

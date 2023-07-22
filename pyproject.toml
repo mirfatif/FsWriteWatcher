@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "setuptools_scm[toml]>=6.2", "Cython~=3.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fs_watcher"
+authors = [
+    { name = "Irfan Latif", email = "mirfatif.dev@gmail.com" },
+]
+description = "Use fanotify to find out which processes are making the most filesystem R/W events."
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Operating System :: POSIX :: Linux",
+]
+requires-python = ">=3.10"
+dynamic = ["version", "dependencies"]
+
+[project.urls]
+"Homepage" = "https://github.com/mirfatif/FsWriteWatcher"
+"Bug Tracker" = "https://github.com/mirfatif/FsWriteWatcher/issues"
+
+[project.scripts]
+"fs_watcher.py" = "mirfatif.fs_watcher.fs_watcher:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"mirfatif.fs_watcher.etc.systemd.system" = ["fs_watcher.service"]
+
+# For dynamic version from git tag.
+[tool.setuptools_scm]
+
+# [project.dependencies] is a better way. But PyCharm 
+# shows warning if requirements.txt is not found.
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

@@ -16,15 +16,24 @@ cdef extern from 'fa_notify.c':
 
 FS_EVENTS = [evt.decode() for evt in EVENT_NAMES]
 
-cdef void fs_evt_cy_cb(fs_event event) nogil:
+cdef void fs_evt_cy_cb(fs_event event) noexcept nogil:
     with gil:
-        global fs_evt_py_cb
-        fs_evt_py_cb(event)
+        global fs_evt_py_cb, fs_evt_py_cb_exc
+        try:
+            fs_evt_py_cb(event)
+        except Exception as e:
+            fs_evt_py_cb_exc = e
+            stop_fs_events()
 
 def start_fs_events_nat(mount_path, cb_func):
-    global fs_evt_py_cb
+    global fs_evt_py_cb, fs_evt_py_cb_exc
     fs_evt_py_cb = cb_func
+    fs_evt_py_cb_exc = None
+
     cdef char *mp = mount_path
     with nogil:
         if start_fs_events(mp, &fs_evt_cy_cb) == EXIT_FAILURE:
             raise OSError('Filesystem event listener failed')
+
+    if fs_evt_py_cb_exc:
+        raise fs_evt_py_cb_exc

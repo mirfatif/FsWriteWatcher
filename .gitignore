@@ -1,2 +1,5 @@
-/fa_notify.so
-/.idea
+/.idea/
+/native/fa_notify-bind.c
+/src/*.egg-info/
+/dist/
+/build/
