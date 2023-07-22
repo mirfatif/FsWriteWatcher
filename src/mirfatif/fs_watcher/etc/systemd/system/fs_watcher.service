@@ -5,7 +5,7 @@ StartLimitIntervalSec=1d
 StartLimitBurst=5
 
 [Service]
-ExecStart=/PATH/TO/fs_watcher.py --server
+ExecStart=/usr/bin/python3 -m mirfatif.fs_watcher.fs_watcher --server
 
 AmbientCapabilities=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
@@ -20,7 +20,7 @@ TimeoutStopSec=30
 User=nobody
 Group=nogroup
 
-#Environment=PYTHONUSERBASE=/PATH/TO/python_user_base
+Environment=PYTHONUSERBASE=/PATH/TO/python_user_base
 
 [Install]
 WantedBy=multi-user.target

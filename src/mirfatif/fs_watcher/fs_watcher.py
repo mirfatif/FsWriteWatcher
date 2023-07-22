@@ -1,4 +1,5 @@
 #!/usr/bin/python
+
 import builtins
 import collections
 import copy
@@ -11,7 +12,6 @@ import os.path
 import pickle
 import signal
 import stat
-import subprocess
 import sys
 import threading
 import time
@@ -19,6 +19,7 @@ import traceback
 from types import SimpleNamespace
 from typing import Callable
 
+import mirfatif.fs_watcher.fa_notify as fa_notify
 import pynng
 import pypager
 
@@ -628,7 +629,7 @@ def print_usage(ex_code: int = None) -> None:
     print(f'\t--dump-file=<PATH>       Dump file path (default: {DUMP_FILE_PATH})')
     print(f'\t--dump-interval=<SEC>    Dump auto-save interval (default: {DUMP_SAVE_INTERVAL})')
     print(f'\t--rotate=<MBs>           Rotate dump file if exceeds this size (default: {DUMP_FILE_SIZE} MB)')
-    print(f'\t--debug=1|2              Debug level (default: {DEBUG_LEVEL})')
+    print(f'\t--debug=1-2              Debug level (default: {DEBUG_LEVEL})')
 
     print('\n\tRotated Files:')
     print(f'\t\tOld / archived / rotated dump files have numbers (1 to 10) appended to them with dot.')
@@ -785,50 +786,6 @@ def get_opts() -> None:
         client_cmd.filter = ftr
 
 
-def build_library(mod: str) -> None:
-    if not sys.stdin.isatty():
-        return
-
-    my_dir = os.path.dirname(os.path.realpath(sys.argv[0]))
-
-    lib = f'{mod}.so'
-    if os.path.exists(os.path.join(my_dir, lib)):
-        return
-
-    cwd = os.getcwd()
-    os.chdir(my_dir)
-
-    print(f'Building module: {mod}')
-
-    def del_file(*files):
-        for file in files:
-            if os.path.exists(file):
-                os.remove(file)
-
-    c = f'{mod}_tmp.c'
-
-    # cproto -f1 proc_event_connector.c | grep -vE '/\*' | sed 's|;\s$||'
-
-    try:
-        if not (err := subprocess.call(f'cython -3 {mod}.pyx -o {c}'.split())):
-            ver = f'{sys.version_info[0]}.{sys.version_info[1]}'
-            cp = subprocess.run(f'python{ver}-config --includes'.split(),
-                                stdout=subprocess.PIPE, text=True)
-
-            if not (err := cp.returncode):
-                include = cp.stdout[:-1]
-                err = err or subprocess.call(f'cc -Wall -shared -fPIC {include} {c} -o {lib}'.split())
-                err = err or subprocess.call(f'strip -s -S --strip-unneeded {lib}'.split())
-
-        if err:
-            del_file(lib)
-            print_err('Failed to build native library')
-            sys.exit(err)
-    finally:
-        del_file(c)
-        os.chdir(cwd)
-
-
 def check_caps() -> None:
     # include <linux/capability.h>
     cap_dac_read_search = 1 << 2
@@ -859,7 +816,10 @@ def check_caps() -> None:
 
         if sys.stdin.isatty() and sys.stdout.isatty():
             print_err(' Restarting...')
-            os.execvp('priv_exec', ['priv_exec', '--caps=dac_read_search,sys_admin', '--', *sys.argv])
+            os.execvp(
+                'priv_exec',
+                ['priv_exec', '-kHOME,PYTHONUSERBASE', '--caps=dac_read_search,sys_admin', '--', *sys.argv]
+            )
             print_err('Failed to execute priv_exec')
 
         print_err('Run with root')
@@ -882,44 +842,51 @@ def override_print():
     print = _print
 
 
-if __name__ == '__main__':
-    nng_sock_path: str = NNG_SOCK_PATH
-
-    # Server options
-    mount_path = MOUNT_PATH
-    dump_file_path = DUMP_FILE_PATH
-    dump_file_size = DUMP_FILE_SIZE
-    dump_save_interval: int = DUMP_SAVE_INTERVAL
-    debug_level: int = DEBUG_LEVEL
-
-    # Client options
-    client_cmd: ClientCmd | None = None
-
-    build_library('fa_notify')
-    # noinspection PyUnresolvedReferences
-    import fa_notify  # noqa
+def main():
+    global nng_sock_path, ipc_address
 
     get_opts()
 
     # Better if it's abstract.
-    ipc_address: str = f'ipc://{nng_sock_path}'
+    ipc_address = f'ipc://{nng_sock_path}'
 
     if client_cmd:
         run_client()
         sys.exit()
 
     check_caps()
-
-    print = builtins.print
     override_print()
-
-    raw_events: Queue = Queue()
-    events: dict[str, SimpleNamespace] = {}
-    events_lock = threading.Lock()
-
-    dump_start_time: float = time.time()
-    last_dump_ts: float = 0
-
-    nng_server: pynng.Socket
-
     start_server()
+
+
+################
+# GLOBAL STATE #
+################
+
+print = builtins.print
+
+nng_sock_path: str = NNG_SOCK_PATH
+
+# Server options
+mount_path = MOUNT_PATH
+dump_file_path = DUMP_FILE_PATH
+dump_file_size = DUMP_FILE_SIZE
+dump_save_interval: int = DUMP_SAVE_INTERVAL
+debug_level: int = DEBUG_LEVEL
+
+# Client options
+client_cmd: ClientCmd | None = None
+
+ipc_address: str
+
+raw_events: Queue = Queue()
+events: dict[str, SimpleNamespace] = {}
+events_lock = threading.Lock()
+
+dump_start_time: float = time.time()
+last_dump_ts: float = 0
+
+nng_server: pynng.Socket
+
+if __name__ == '__main__':
+    main()
